@@ -12,33 +12,32 @@ jobs:
       - name: Provenance
         run: uname -m && sw_vers && xcodebuild -version
 
-      - name: Build
+      - name: Build and Run
         run: |
           cd WKTest
           swift build -c release 2>&1
-          BIN=$(swift build -c release --show-bin-path 2>/dev/null)/WKTest
-          echo "BIN=$BIN" >> $GITHUB_ENV
+          BIN_DIR=$(swift build -c release --show-bin-path)
+          BIN="$BIN_DIR/WKTest"
+          echo "BIN: $BIN"
+          ls -la "$BIN"
 
-      - name: Sign
-        run: codesign --force --deep --sign - "$BIN" 2>&1 || true
+          codesign --force --deep --sign - "$BIN" 2>&1 || true
 
-      - name: Run WKTest
-        run: |
+          echo "=== Running WKTest ==="
           set +e
           timeout 35 "$BIN" 2>&1
           EXIT=$?
           set -e
-          echo "exit=$EXIT" >> $GITHUB_ENV
+
+          echo "exit=$EXIT"
           if [ $EXIT -eq 0 ]; then
             echo "RESULT=PASS"
           elif [ $EXIT -eq 124 ]; then
-            echo "RESULT=TIMEOUT_no_WindowServer"
+            echo "RESULT=TIMEOUT"
           else
             echo "RESULT=FAIL_$EXIT"
-          fi >> $GITHUB_ENV
+          fi
 
       - name: Summary
         if: always()
-        run: |
-          echo "OS: $(sw_vers -productVersion) arch: $(uname -m)"
-          echo "exit=$exit RESULT=$RESULT"
+        run: echo "OS=$(sw_vers -productVersion) arch=$(uname -m)"
