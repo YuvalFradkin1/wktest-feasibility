@@ -1,4 +1,4 @@
-name: WKWebView Phase B — AcceleratedEffect Race
+name: WKWebView Phase B — WebRTC Hostname Crash
 
 on:
   workflow_dispatch:
@@ -25,20 +25,24 @@ jobs:
       - name: Sign
         run: codesign --force --deep --sign - "$BIN" 2>&1 || true
 
-      - name: Phase B
+      - name: Phase B — Control + Exploit
         run: |
-          echo "Signal: 7224709bf0 — AcceleratedEffect polygon cache race"
+          echo "Signal: 4a2069dce8 — WebRTC overlong hostname"
           set +e
-          perl -e 'alarm 150; exec @ARGV' "$BIN" 2>&1
+          perl -e 'alarm 90; exec @ARGV' "$BIN" 2>&1
           EXIT=$?
           set -e
           echo "exit=$EXIT"
           echo "phase_b_exit=$EXIT" >> $GITHUB_ENV
           CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
-          ls "$CRASH_DIR"/*.crash 2>/dev/null && head -80 "$CRASH_DIR"/*.crash || echo "no crash logs"
+          echo "--- Crash logs ---"
+          ls "$CRASH_DIR"/ 2>/dev/null && \
+            for f in "$CRASH_DIR"/*.crash "$CRASH_DIR"/*.ips; do
+              [ -f "$f" ] && echo "=== $f ===" && head -80 "$f"
+            done || echo "no crash logs"
           if [ $EXIT -eq 139 ]; then echo "RESULT=SIGSEGV"
           elif [ $EXIT -eq 134 ]; then echo "RESULT=SIGABRT"
-          elif [ $EXIT -eq 0 ]; then echo "RESULT=INCONCLUSIVE"
+          elif [ $EXIT -eq 0 ]; then echo "RESULT=COMPLETED_exit0"
           else echo "RESULT=EXIT_$EXIT"; fi >> $GITHUB_ENV
 
       - name: Summary

