@@ -1,14 +1,15 @@
 import AppKit
 import WebKit
 
-// Phase B retry — 7224709bf0
-// 3 WKWebView instances, 20-30 iterations, aggressive scroll stress
-// Target: RemoteLayerTreeEventDispatcher race on TinyLRUCache
-// PLATFORM(MAC) only — confirmed active on macos-latest
+// Phase B extended — 7224709bf0
+// KEY FIX: add commitTimer (document.title = ++n every 33ms)
+// This forces renderingUpdateComplete() on main thread
+// while ScrollingThread runs didRefreshDisplay()
+// = the actual race condition Apple reproduced
 
 let TRIGGER_HTML = """
 <!DOCTYPE html><html><head><style>
-body { height: 5000px; margin: 0; }
+body { height: 5000px; }
 .mover {
     position: absolute; top: 50px; left: 50px;
     width: 40px; height: 40px; will-change: transform;
@@ -27,23 +28,61 @@ body { height: 5000px; margin: 0; }
 <div class="mover" id="m2"></div><div class="mover" id="m3"></div>
 <div class="mover" id="m4"></div><div class="mover" id="m5"></div>
 <script>
-// Aggressive scroll pump — max concurrency pressure
-let pos = 0; let dir = 1; let ticks = 0;
+// Distinct polygons from popup to force LRU eviction churn
+// (forces cache misses → more concurrent access)
+
+// CRITICAL: commitTimer forces renderingUpdateComplete() on main thread
+// while ScrollingThread runs didRefreshDisplay()
+let n = 0;
+let commitTimer = setInterval(() => { document.title = ++n; }, 33);
+
+// Scroll pump — drives ScrollingThread::didRefreshDisplay
+let dir = 1;
 function pump() {
-    pos += dir * 400;
-    if (pos > 4000 || pos < 0) dir = -dir;
-    window.scrollTo(0, pos);
-    ticks++;
-    if (ticks < 3000) requestAnimationFrame(pump);
-    else window.webkit.messageHandlers.done.postMessage(ticks);
+    let y = scrollY + dir * 600;
+    if (y > 3800) { dir = -1; y = 3800; }
+    if (y < 10)   { dir =  1; y = 10; }
+    scrollTo({ top: y, behavior: 'smooth' });
 }
-window.addEventListener('load', () => {
-    // Force layout + compositing
-    document.querySelectorAll('.mover').forEach(el => {
-        el.style.transform = 'translateZ(0)';
-    });
-    requestAnimationFrame(pump);
-});
+let scrollTimer = setInterval(pump, 60);
+pump();
+window.webkit.messageHandlers.ready.postMessage('ready');
+</script></body></html>
+"""
+
+// Popup page — distinct polygons to churn LRU cache
+let POPUP_HTML = """
+<!DOCTYPE html><html><head><style>
+body { height: 5000px; }
+.mover {
+    position: absolute; top: 50px; left: 50px;
+    width: 40px; height: 40px; will-change: transform;
+    animation: move auto linear;
+    animation-timeline: scroll(root);
+}
+@keyframes move { from{offset-distance:0%} to{offset-distance:100%} }
+#n0{offset-path:polygon(0% 0%,23% 2%,5% 10%,10% 48%,94% 13%)}
+#n1{offset-path:polygon(0% 0%,48% 4%,30% 35%,35% 23%,87% 38%)}
+#n2{offset-path:polygon(0% 0%,73% 7%,55% 60%,60% 73%,77% 63%)}
+#n3{offset-path:polygon(0% 0%,98% 9%,80% 85%,85% 98%,67% 88%)}
+#n4{offset-path:polygon(0% 0%,100% 12%,100% 100%,100% 100%,57% 100%)}
+#n5{offset-path:polygon(0% 0%,100% 14%,100% 100%,100% 100%,47% 100%)}
+</style></head><body>
+<div class="mover" id="n0"></div><div class="mover" id="n1"></div>
+<div class="mover" id="n2"></div><div class="mover" id="n3"></div>
+<div class="mover" id="n4"></div><div class="mover" id="n5"></div>
+<script>
+let m = 0;
+let commitTimer = setInterval(() => { document.title = ++m; }, 33);
+let dir = 1;
+function pump() {
+    let y = scrollY + dir * 600;
+    if (y > 3800) { dir = -1; y = 3800; }
+    if (y < 10)   { dir =  1; y = 10; }
+    scrollTo({ top: y, behavior: 'smooth' });
+}
+setInterval(pump, 60);
+pump();
 </script></body></html>
 """
 
@@ -53,61 +92,64 @@ class PhaseB: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMes
     var windows: [NSWindow] = []
     var webViews: [WKWebView] = []
     var iteration = 0
-    let maxIterations = 25
-    var doneCount = 0
-    var crashDetected = false
-    var passCount = 0
-    let requiredPasses = 3
+    let maxIterations = 30
     var startTime = Date()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         startTime = Date()
-        print("=== Phase B retry: 7224709bf0 AcceleratedEffect race ===")
+        print("=== Phase B extended: 7224709bf0 + commitTimer ===")
         print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
-        print("Config: 3 WKWebViews, \(maxIterations) iterations, \(requiredPasses) passes required")
-        print("")
+        print("KEY: commitTimer forces renderingUpdateComplete/ScrollingThread race")
+        print("Config: 2 WKWebViews (opener+popup pattern), \(maxIterations) iterations")
         runControl()
     }
 
+    func makeWebView(name: String) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(self, name: "ready")
+        let wv = WKWebView(frame: NSRect(x:0,y:0,width:900,height:700), configuration: config)
+        wv.navigationDelegate = self
+        let win = NSWindow(contentRect: NSRect(x:0,y:0,width:900,height:700),
+                          styleMask: [.titled,.resizable], backing: .buffered, defer: false)
+        win.title = name
+        win.contentView = wv
+        win.makeKeyAndOrderFront(nil)
+        windows.append(win)
+        webViews.append(wv)
+        return wv
+    }
+
     func runControl() {
-        print("--- CONTROL: static page (no animation) ---")
-        let wv = makeWebView(trigger: false)
+        print("\n--- CONTROL ---")
+        let wv = makeWebView(name: "Control")
         wv.loadHTMLString(CONTROL_HTML, baseURL: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-            print("CONTROL: ok — no crash")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            print("CONTROL: ok")
+            self.cleanup()
             self.runIteration()
         }
     }
 
     func runIteration() {
         iteration += 1
-        doneCount = 0
-        print("\n--- TRIGGER iteration \(iteration)/\(maxIterations) ---")
+        print("\n--- TRIGGER \(iteration)/\(maxIterations) (opener+popup, commitTimer) ---")
+        // Opener window
+        let opener = makeWebView(name: "Opener-\(iteration)")
+        opener.loadHTMLString(TRIGGER_HTML, baseURL: URL(string:"https://localhost/")!)
+        // Popup window — distinct polygons, same UIProcess
+        let popup = makeWebView(name: "Popup-\(iteration)")
+        popup.loadHTMLString(POPUP_HTML, baseURL: URL(string:"https://localhost/popup")!)
 
-        // 3 WKWebView instances = 3 RemoteLayerTreeEventDispatchers racing
-        for i in 0..<3 {
-            let wv = makeWebView(trigger: true)
-            wv.loadHTMLString(TRIGGER_HTML,
-                baseURL: URL(string: "https://localhost:\(9000 + i)")!)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-            if !self.crashDetected {
-                print("iteration \(self.iteration): timeout (no crash)")
-                self.cleanup()
-                self.next()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            print("TRIGGER \(self.iteration): no crash (25s)")
+            self.cleanup()
+            if self.iteration < self.maxIterations {
+                self.runIteration()
+            } else {
+                let elapsed = Int(Date().timeIntervalSince(self.startTime))
+                print("\n=== RESULT: INCONCLUSIVE — no crash after \(self.maxIterations) iterations (\(elapsed)s) ===")
+                exit(0)
             }
-        }
-    }
-
-    func next() {
-        if iteration < maxIterations {
-            runIteration()
-        } else {
-            let elapsed = Int(Date().timeIntervalSince(startTime))
-            print("\n=== RESULT: no crash after \(maxIterations) iterations (\(elapsed)s) ===")
-            print("RESULT=INCONCLUSIVE")
-            exit(0)
         }
     }
 
@@ -117,45 +159,11 @@ class PhaseB: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMes
         windows.removeAll()
     }
 
-    func makeWebView(trigger: Bool) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        if trigger {
-            config.userContentController.add(self, name: "done")
-        }
-        // Force threaded rendering
-        config.preferences.setValue(true, forKey: "acceleratedDrawingEnabled")
-        let wv = WKWebView(
-            frame: NSRect(x: 0, y: 0, width: 800, height: 600),
-            configuration: config)
-        wv.navigationDelegate = self
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled], backing: .buffered, defer: false)
-        win.contentView = wv
-        windows.append(win)
-        webViews.append(wv)
-        return wv
-    }
-
-    func userContentController(_ c: WKUserContentController,
-                               didReceive msg: WKScriptMessage) {
-        doneCount += 1
-        if doneCount >= 3 {
-            print("iteration \(iteration): all 3 pumps done — no crash")
-            cleanup()
-            next()
-        }
-    }
-
+    func userContentController(_ c: WKUserContentController, didReceive msg: WKScriptMessage) {}
     func webView(_ wv: WKWebView, didFail n: WKNavigation!, withError e: Error) {}
-    func webView(_ wv: WKWebView, didFailProvisionalNavigation n: WKNavigation!,
-                 withError e: Error) {}
 }
 
-// Monitor for WebContent/UIProcess crash signals
-signal(SIGCHLD) { _ in
-    print("*** SIGCHLD — child process terminated ***")
-}
+signal(SIGCHLD) { _ in print("*** SIGCHLD ***") }
 
 let app = NSApplication.shared
 let d = PhaseB()
