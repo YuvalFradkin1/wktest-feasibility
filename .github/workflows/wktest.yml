@@ -20,19 +20,23 @@ jobs:
           BIN="$BIN_DIR/WKTest"
           echo "BIN: $BIN"
           ls -la "$BIN"
-
           codesign --force --deep --sign - "$BIN" 2>&1 || true
 
           echo "=== Running WKTest ==="
           set +e
-          timeout 35 "$BIN" 2>&1
+          # macOS uses gtimeout (coreutils) or perl fallback
+          if command -v gtimeout &>/dev/null; then
+            gtimeout 35 "$BIN" 2>&1
+          else
+            perl -e 'alarm 35; exec @ARGV' "$BIN" 2>&1
+          fi
           EXIT=$?
           set -e
 
           echo "exit=$EXIT"
           if [ $EXIT -eq 0 ]; then
             echo "RESULT=PASS"
-          elif [ $EXIT -eq 124 ]; then
+          elif [ $EXIT -eq 142 ]; then
             echo "RESULT=TIMEOUT"
           else
             echo "RESULT=FAIL_$EXIT"
