@@ -1,47 +1,48 @@
-name: WKWebView Feasibility
+name: WKWebView Phase B — AcceleratedEffect Race
 
 on:
   workflow_dispatch:
 
 jobs:
-  wktest:
+  phase-b:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Provenance
-        run: uname -m && sw_vers && xcodebuild -version
+        run: |
+          uname -m && sw_vers && xcodebuild -version
+          defaults read /System/Library/Frameworks/WebKit.framework/Versions/A/Resources/Info.plist CFBundleVersion 2>/dev/null || true
 
-      - name: Build and Run
+      - name: Build
         run: |
           cd WKTest
           swift build -c release 2>&1
           BIN_DIR=$(swift build -c release --show-bin-path)
-          BIN="$BIN_DIR/WKTest"
-          echo "BIN: $BIN"
-          ls -la "$BIN"
-          codesign --force --deep --sign - "$BIN" 2>&1 || true
+          echo "BIN=$BIN_DIR/WKTest" >> $GITHUB_ENV
+          ls -la "$BIN_DIR/WKTest"
 
-          echo "=== Running WKTest ==="
+      - name: Sign
+        run: codesign --force --deep --sign - "$BIN" 2>&1 || true
+
+      - name: Phase B
+        run: |
+          echo "Signal: 7224709bf0 — AcceleratedEffect polygon cache race"
           set +e
-          # macOS uses gtimeout (coreutils) or perl fallback
-          if command -v gtimeout &>/dev/null; then
-            gtimeout 35 "$BIN" 2>&1
-          else
-            perl -e 'alarm 35; exec @ARGV' "$BIN" 2>&1
-          fi
+          perl -e 'alarm 150; exec @ARGV' "$BIN" 2>&1
           EXIT=$?
           set -e
-
           echo "exit=$EXIT"
-          if [ $EXIT -eq 0 ]; then
-            echo "RESULT=PASS"
-          elif [ $EXIT -eq 142 ]; then
-            echo "RESULT=TIMEOUT"
-          else
-            echo "RESULT=FAIL_$EXIT"
-          fi
+          echo "phase_b_exit=$EXIT" >> $GITHUB_ENV
+          CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
+          ls "$CRASH_DIR"/*.crash 2>/dev/null && head -80 "$CRASH_DIR"/*.crash || echo "no crash logs"
+          if [ $EXIT -eq 139 ]; then echo "RESULT=SIGSEGV"
+          elif [ $EXIT -eq 134 ]; then echo "RESULT=SIGABRT"
+          elif [ $EXIT -eq 0 ]; then echo "RESULT=INCONCLUSIVE"
+          else echo "RESULT=EXIT_$EXIT"; fi >> $GITHUB_ENV
 
       - name: Summary
         if: always()
-        run: echo "OS=$(sw_vers -productVersion) arch=$(uname -m)"
+        run: |
+          echo "OS=$(sw_vers -productVersion) arch=$(uname -m)"
+          echo "exit=$phase_b_exit RESULT=$RESULT"
