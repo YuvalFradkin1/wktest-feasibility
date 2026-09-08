@@ -1,0 +1,44 @@
+name: WKWebView Feasibility
+
+on:
+  workflow_dispatch:
+
+jobs:
+  wktest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provenance
+        run: uname -m && sw_vers && xcodebuild -version
+
+      - name: Build
+        run: |
+          cd WKTest
+          swift build -c release 2>&1
+          BIN=$(swift build -c release --show-bin-path 2>/dev/null)/WKTest
+          echo "BIN=$BIN" >> $GITHUB_ENV
+
+      - name: Sign
+        run: codesign --force --deep --sign - "$BIN" 2>&1 || true
+
+      - name: Run WKTest
+        run: |
+          set +e
+          timeout 35 "$BIN" 2>&1
+          EXIT=$?
+          set -e
+          echo "exit=$EXIT" >> $GITHUB_ENV
+          if [ $EXIT -eq 0 ]; then
+            echo "RESULT=PASS"
+          elif [ $EXIT -eq 124 ]; then
+            echo "RESULT=TIMEOUT_no_WindowServer"
+          else
+            echo "RESULT=FAIL_$EXIT"
+          fi >> $GITHUB_ENV
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "OS: $(sw_vers -productVersion) arch: $(uname -m)"
+          echo "exit=$exit RESULT=$RESULT"
