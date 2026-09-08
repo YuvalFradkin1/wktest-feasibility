@@ -1,4 +1,4 @@
-name: WKWebView Phase B — WebRTC Hostname Crash
+name: WKWebView Phase B retry — AcceleratedEffect Race
 
 on:
   workflow_dispatch:
@@ -6,12 +6,13 @@ on:
 jobs:
   phase-b:
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Provenance
         run: |
-          uname -m && sw_vers && xcodebuild -version
+          uname -m && sw_vers
           defaults read /System/Library/Frameworks/WebKit.framework/Versions/A/Resources/Info.plist CFBundleVersion 2>/dev/null || true
 
       - name: Build
@@ -25,28 +26,36 @@ jobs:
       - name: Sign
         run: codesign --force --deep --sign - "$BIN" 2>&1 || true
 
-      - name: Phase B — Control + Exploit
+      - name: Phase B — 3x WKWebView, 25 iterations
         run: |
-          echo "Signal: 4a2069dce8 — WebRTC overlong hostname"
+          echo "Signal: 7224709bf0 — AcceleratedEffect polygon cache race"
+          echo "Config: 3 WKWebViews, 25 iterations, 3 passes required"
           set +e
-          perl -e 'alarm 90; exec @ARGV' "$BIN" 2>&1
+          perl -e 'alarm 2400; exec @ARGV' "$BIN" 2>&1
           EXIT=$?
           set -e
-          echo "exit=$EXIT"
-          echo "phase_b_exit=$EXIT" >> $GITHUB_ENV
+          echo "exit=$EXIT" >> $GITHUB_ENV
+          if [ $EXIT -eq 139 ]; then
+            echo "RESULT=SIGSEGV" >> $GITHUB_ENV
+            echo "*** SIGSEGV ***"
+          elif [ $EXIT -eq 134 ]; then
+            echo "RESULT=SIGABRT" >> $GITHUB_ENV
+            echo "*** SIGABRT ***"
+          elif [ $EXIT -eq 0 ]; then
+            echo "RESULT=INCONCLUSIVE" >> $GITHUB_ENV
+          else
+            echo "RESULT=EXIT_$EXIT" >> $GITHUB_ENV
+          fi
           CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
-          echo "--- Crash logs ---"
-          ls "$CRASH_DIR"/ 2>/dev/null && \
+          ls "$CRASH_DIR"/*.crash "$CRASH_DIR"/*.ips 2>/dev/null && \
             for f in "$CRASH_DIR"/*.crash "$CRASH_DIR"/*.ips; do
-              [ -f "$f" ] && echo "=== $f ===" && head -80 "$f"
+              [ -f "$f" ] && echo "=== CRASH: $f ===" && head -80 "$f"
             done || echo "no crash logs"
-          if [ $EXIT -eq 139 ]; then echo "RESULT=SIGSEGV"
-          elif [ $EXIT -eq 134 ]; then echo "RESULT=SIGABRT"
-          elif [ $EXIT -eq 0 ]; then echo "RESULT=COMPLETED_exit0"
-          else echo "RESULT=EXIT_$EXIT"; fi >> $GITHUB_ENV
 
       - name: Summary
         if: always()
         run: |
           echo "OS=$(sw_vers -productVersion) arch=$(uname -m)"
-          echo "exit=$phase_b_exit RESULT=$RESULT"
+          echo "exit=$exit RESULT=$RESULT"
+          [[ "$RESULT" == SIGSEGV || "$RESULT" == SIGABRT ]] && \
+            echo "Phase B: PASS" || echo "Phase B: $RESULT"
