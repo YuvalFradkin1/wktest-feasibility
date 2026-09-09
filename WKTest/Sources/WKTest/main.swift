@@ -18,7 +18,8 @@ let TRIGGER_HTML = """
 <div id="target"></div>
 <script>
 setTimeout(() => {
-  window.webkit.messageHandlers.done.postMessage('loaded');
+  window.getComputedStyle(document.getElementById('target')).top;
+window.webkit.messageHandlers.done.postMessage('loaded');
 }, 500);
 </script>
 """
