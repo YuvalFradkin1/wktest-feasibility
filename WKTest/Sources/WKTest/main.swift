@@ -92,7 +92,7 @@ class PhaseB: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMes
     var windows: [NSWindow] = []
     var webViews: [WKWebView] = []
     var iteration = 0
-    let maxIterations = 30
+    let maxIterations = 20
     var startTime = Date()
 
     func applicationDidFinishLaunching(_ n: Notification) {
