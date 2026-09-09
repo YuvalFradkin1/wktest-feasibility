@@ -59,3 +59,15 @@ jobs:
           echo "exit=$exit RESULT=$RESULT"
           [[ "$RESULT" == SIGSEGV || "$RESULT" == SIGABRT ]] && \
             echo "Phase B: PASS" || echo "Phase B: $RESULT"
+
+      - name: Crash logs after run
+        if: always()
+        run: |
+          CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
+          echo "=== Crash logs ==="
+          find "$CRASH_DIR" -name "*.crash" -o -name "*.ips" 2>/dev/null | \
+            while read f; do
+              echo "--- $f ---"
+              head -60 "$f"
+            done || echo "none"
+          echo "exit was: $exit"
