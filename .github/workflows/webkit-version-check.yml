@@ -1,0 +1,14 @@
+name: webkit-version-check
+on: [workflow_dispatch]
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - name: WebKit version
+        run: |
+          defaults read /System/Library/Frameworks/WebKit.framework/Versions/A/Resources/Info.plist CFBundleVersion 2>/dev/null || \
+          defaults read /System/Library/Frameworks/WebKit.framework/Resources/Info.plist CFBundleVersion 2>/dev/null || \
+          plutil -p /System/Library/Frameworks/WebKit.framework/Versions/A/Resources/Info.plist | grep -i "bundle\|version" || \
+          true
+          sw_vers
+          uname -m
