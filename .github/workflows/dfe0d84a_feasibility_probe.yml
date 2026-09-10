@@ -1,0 +1,219 @@
+name: dfe0d84a_feasibility_probe
+# PIPELINE POSITION: DISCOVERY — minimal environment probe
+# Signal: dfe0d84a (hypothesis only)
+# Goal: 4 facts only — WKWEBVIEW_LOADED / WEBRTC_AVAILABLE / FRAMES_SENT / GPU_OR_MEDIA_PROCESS_OBSERVED
+# Output is NOT a PoC and NOT an impact claim
+# SUSPEND condition: framesSent=0 OR no subprocess → environment fit issue, not Dead Zone
+
+on:
+  workflow_dispatch:
+
+jobs:
+  feasibility-probe:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── FACT 0: environment snapshot ──────────────────────────────────────
+      - name: env-snapshot
+        run: |
+          echo "=== ENV SNAPSHOT ==="
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu hw.memsize machdep.cpu.brand_string 2>/dev/null || true
+          # WebKit framework presence
+          ls /System/Library/Frameworks/WebKit.framework/Versions/A/WebKit 2>/dev/null \
+            && echo "WEBKIT_FRAMEWORK: PRESENT" || echo "WEBKIT_FRAMEWORK: MISSING"
+          # GPU / Metal
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -i "chipset\|metal\|vendor" || \
+            echo "GPU_INFO: unavailable"
+
+      # ── FACT 1: WKWebView loads HTML ──────────────────────────────────────
+      - name: build-wkwebview-probe
+        run: |
+          mkdir -p probe
+          cat > probe/probe.swift << 'SWIFTEOF'
+          import Foundation
+          import WebKit
+
+          // Minimal offscreen WKWebView — no NSApplication, no window needed
+          // WKWebView works without a display server for message handler tests
+
+          let cfg = WKWebViewConfiguration()
+          let wv  = WKWebView(frame: .init(x:0,y:0,width:320,height:240),
+                              configuration: cfg)
+
+          class Delegate: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+              var loaded = false
+              var webrtcAvailable = false
+              var framesSent = 0
+              var done = false
+
+              func userContentController(_ ucc: WKUserContentController,
+                                         didReceive msg: WKScriptMessage) {
+                  let body = msg.body as? String ?? ""
+                  if body.hasPrefix("LOADED:")    { loaded = true }
+                  if body.hasPrefix("WEBRTC:")    { webrtcAvailable = body.contains("true") }
+                  if body.hasPrefix("FRAMES:") {
+                      framesSent = Int(body.dropFirst(7)) ?? 0
+                  }
+                  if body.hasPrefix("DONE")       { done = true }
+              }
+              func webView(_ wv: WKWebView,
+                           didFinish nav: WKNavigation!) { /* navigation done */ }
+          }
+
+          let delegate = Delegate()
+          cfg.userContentController.add(delegate, name: "probe")
+          wv.navigationDelegate = delegate
+
+          let html = """
+          <!DOCTYPE html><html><body>
+          <canvas id="c" width="321" height="240"></canvas>
+          <script>
+          (async () => {
+            window.webkit.messageHandlers.probe.postMessage("LOADED:1");
+
+            // FACT 1: WKWebView loaded
+            // FACT 2: WebRTC available
+            const rtcAvail = typeof RTCPeerConnection !== 'undefined';
+            window.webkit.messageHandlers.probe.postMessage("WEBRTC:" + rtcAvail);
+
+            if (!rtcAvail) {
+              window.webkit.messageHandlers.probe.postMessage("DONE:no-rtc");
+              return;
+            }
+
+            // FACT 3: captureStream + frame count
+            const canvas = document.getElementById('c');
+            const ctx = canvas.getContext('2d');
+            let framesSent = 0;
+
+            const stream = canvas.captureStream(30);
+            const pc1 = new RTCPeerConnection();
+            const pc2 = new RTCPeerConnection();
+            pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+            pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+            stream.getTracks().forEach(t => pc1.addTrack(t, stream));
+
+            const offer = await pc1.createOffer();
+            await pc1.setLocalDescription(offer);
+            await pc2.setRemoteDescription(offer);
+            const answer = await pc2.createAnswer();
+            await pc2.setLocalDescription(answer);
+            await pc1.setRemoteDescription(answer);
+
+            // Draw odd-width frames for 8 seconds (probe duration)
+            const draw = () => {
+              ctx.fillStyle = 'rgb(' + (Math.random()*255|0) + ',100,100)';
+              ctx.fillRect(0, 0, 321, 240);
+              ctx.fillRect(320, 0, 1, 240); // stress the odd-width boundary
+              framesSent++;
+              requestAnimationFrame(draw);
+            };
+            draw();
+
+            // Report frames at 4s and done at 8s
+            setTimeout(() => {
+              window.webkit.messageHandlers.probe.postMessage("FRAMES:" + framesSent);
+            }, 4000);
+            setTimeout(() => {
+              window.webkit.messageHandlers.probe.postMessage("FRAMES:" + framesSent);
+              window.webkit.messageHandlers.probe.postMessage("DONE:complete");
+            }, 8000);
+          })();
+          </script></body></html>
+          """
+
+          wv.loadHTMLString(html, baseURL: nil)
+
+          // Run for 12 seconds
+          let deadline = Date().addingTimeInterval(12)
+          while Date() < deadline {
+              RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+              if delegate.done { break }
+          }
+
+          // Output FACT results
+          print("PROBE_RESULT: WKWEBVIEW_LOADED=\(delegate.loaded ? "YES" : "NO")")
+          print("PROBE_RESULT: WEBRTC_AVAILABLE=\(delegate.webrtcAvailable ? "YES" : "NO")")
+          print("PROBE_RESULT: FRAMES_SENT=\(delegate.framesSent)")
+          SWIFTEOF
+
+          swiftc probe/probe.swift \
+            -framework WebKit \
+            -framework Foundation \
+            -o probe/probe_runner 2>&1
+          echo "BUILD_STATUS: $?"
+
+      # ── FACT 4: GPU / Media subprocess observation ────────────────────────
+      - name: run-probe-with-subprocess-watch
+        id: run-probe
+        run: |
+          echo "=== PRE-RUN PROCESSES ==="
+          ps aux | grep -i "webkit\|gpu\|media\|webrtc" | grep -v grep || true
+
+          # Run probe in background, watch for subprocesses
+          probe/probe_runner 2>&1 | tee probe_output.txt &
+          PROBE_PID=$!
+
+          # Poll for GPU/Media subprocesses during probe run
+          GPU_OBSERVED="NO"
+          MEDIA_OBSERVED="NO"
+          for i in $(seq 1 24); do
+            sleep 0.5
+            if ps aux | grep -i "com.apple.WebKit.GPU" | grep -v grep > /dev/null 2>&1; then
+              GPU_OBSERVED="YES"
+              echo "GPU_SUBPROCESS: OBSERVED at t=$((i/2))s"
+            fi
+            if ps aux | grep -i "com.apple.WebKit.Networking\|com.apple.WebKit.Web" | grep -v grep > /dev/null 2>&1; then
+              MEDIA_OBSERVED="YES"
+              echo "MEDIA_SUBPROCESS: OBSERVED at t=$((i/2))s"
+            fi
+          done
+
+          wait $PROBE_PID || true
+
+          echo ""
+          echo "=== PROBE OUTPUT ==="
+          cat probe_output.txt
+
+          echo ""
+          echo "=== FACT SUMMARY ==="
+          grep "PROBE_RESULT:" probe_output.txt || echo "PROBE_RESULT: no output"
+          echo "PROBE_RESULT: GPU_SUBPROCESS_OBSERVED=$GPU_OBSERVED"
+          echo "PROBE_RESULT: MEDIA_SUBPROCESS_OBSERVED=$MEDIA_OBSERVED"
+
+          # SUSPEND condition check
+          FRAMES=$(grep "FRAMES_SENT=" probe_output.txt | tail -1 | sed 's/.*FRAMES_SENT=//')
+          if [ -z "$FRAMES" ] || [ "$FRAMES" = "0" ]; then
+            echo ""
+            echo "SUSPEND_CONDITION: framesSent=0 — environment fit issue, NOT Dead Zone, NOT ABORT"
+            echo "PIPELINE_POSITION: SUSPEND pending display/RAF investigation"
+          else
+            echo ""
+            echo "PIPELINE_POSITION: CONTINUE — frames confirmed, subprocess status above"
+          fi
+
+      - name: check-diagnostic-reports
+        if: always()
+        run: |
+          echo "=== DIAGNOSTIC REPORTS (post-probe) ==="
+          DIAG=~/Library/Logs/DiagnosticReports
+          mkdir -p "$DIAG"
+          # Any new crash reports from WebKit processes?
+          find "$DIAG" -name "*.ips" -newer probe/probe_runner \
+            -exec echo "CRASH_REPORT: {}" \; \
+            -exec head -30 {} \; 2>/dev/null || \
+            echo "NO_CRASH_REPORTS: none found after probe"
+
+      - name: upload-probe-output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feasibility-probe-output
+          path: probe_output.txt
+          if-no-files-found: ignore
